@@ -208,6 +208,7 @@ async function startInstance(phone, connectionMethod = 'pairing') {
     instances[phone].sock = sock;
 
     let pairingRequested = false;
+    let pairingPersistence = Promise.resolve();
     const issuePairingCode = async () => {
       if (connectionMethod !== 'pairing' || pairingRequested || sock.authState.creds.registered) return;
       pairingRequested = true;
@@ -252,6 +253,20 @@ async function startInstance(phone, connectionMethod = 'pairing') {
         registered: Boolean(sock.authState.creds.registered),
         receivedPendingNotifications: Boolean(receivedPendingNotifications)
       }, 'Baileys connection lifecycle update');
+      if (isNewLogin) {
+        // Baileys signals successful QR pairing with isNewLogin and then closes
+        // with restartRequired (515); QR pairing may not set registered itself.
+        sock.authState.creds.registered = true;
+        pairingPersistence = (async () => {
+          await auth.saveCreds(sock.authState.creds);
+          await saveConnectionMethod(phone, connectionMethod);
+        })();
+        try {
+          await pairingPersistence;
+        } catch (err) {
+          log.error({ phone, err }, 'Failed to persist credentials after successful pairing');
+        }
+      }
       if (qr && !sock.authState.creds.registered) {
         if (connectionMethod === 'qr') {
           try {
@@ -290,6 +305,20 @@ async function startInstance(phone, connectionMethod = 'pairing') {
           cachedWhatsAppWebVersion = null;
           whatsAppWebVersionFetchedAt = 0;
           log.warn({ phone }, 'Invalidated cached WhatsApp Web version after 405 rejection');
+        }
+        if (code === DisconnectReason.restartRequired && sock.authState.creds.me?.id) {
+          sock.authState.creds.registered = true;
+          try {
+            await pairingPersistence;
+            await auth.saveCreds(sock.authState.creds);
+            await saveConnectionMethod(phone, connectionMethod);
+          } catch (err) {
+            log.error({ phone, err }, 'Could not persist credentials after Baileys restart-required close');
+            instances[phone] = { status: 'CRASHED', pairingCode: null, qrCode: null, connectionMethod, sock: null };
+            io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null, qrCode: null });
+            return;
+          }
+          log.info({ phone, code }, 'Pairing completed; restarting with saved credentials');
         }
         if (code === DisconnectReason.loggedOut) {
           delete instances[phone];
