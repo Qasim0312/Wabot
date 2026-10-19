@@ -38,6 +38,11 @@ export async function useMultiSupabaseAuth(supabase, phone) {
   if (!creds) {
     creds = initAuthCreds();
     await writeData('creds', creds);
+  } else if (!creds.registered && creds.me) {
+    // A previous pairing request may have closed before WhatsApp accepted it.
+    delete creds.me;
+    delete creds.pairingCode;
+    await writeData('creds', creds);
   }
 
   return {

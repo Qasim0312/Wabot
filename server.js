@@ -154,28 +154,36 @@ async function startInstance(phone) {
 
     instances[phone].sock = sock;
 
-    if (!sock.authState.creds.registered) {
-      setTimeout(async () => {
-        try {
-          const code = await sock.requestPairingCode(phone);
-          if (instances[phone]?.sock !== sock) return;
-          instances[phone].pairingCode = code;
-          instances[phone].status = 'PAIRING_READY';
-          io.emit('status_update', { phone, status: 'PAIRING_READY', pairingCode: code });
-        } catch (err) {
-          log.error({ err }, 'Pairing engine generation challenge failed');
-          if (instances[phone]?.sock === sock) {
-            instances[phone].status = 'CRASHED';
-            io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null });
-          }
+    let pairingRequested = false;
+    const issuePairingCode = async () => {
+      if (pairingRequested || sock.authState.creds.registered) return;
+      pairingRequested = true;
+      try {
+        const code = await sock.requestPairingCode(phone);
+        if (instances[phone]?.sock !== sock) return;
+        instances[phone].pairingCode = code;
+        instances[phone].status = 'PAIRING_READY';
+        io.emit('status_update', { phone, status: 'PAIRING_READY', pairingCode: code });
+      } catch (err) {
+        log.error({ err }, 'Pairing engine generation challenge failed');
+        if (!sock.authState.creds.registered) {
+          delete sock.authState.creds.me;
+          delete sock.authState.creds.pairingCode;
+          await auth.saveCreds();
         }
-      }, 3000);
-    }
+        pairingRequested = false;
+        if (instances[phone]?.sock === sock) {
+          instances[phone].status = 'CRASHED';
+          io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null });
+        }
+      }
+    };
 
     sock.ev.on('creds.update', auth.saveCreds);
 
-    sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
       if (instances[phone]?.sock !== sock) return;
+      if (qr && !sock.authState.creds.registered) void issuePairingCode();
       if (connection === 'open') {
         instances[phone].status = 'CONNECTED';
         instances[phone].pairingCode = null;
@@ -183,6 +191,7 @@ async function startInstance(phone) {
       }
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
+        log.warn({ phone, code, err: lastDisconnect?.error }, 'WhatsApp connection closed');
         if (code === DisconnectReason.loggedOut) {
           delete instances[phone];
           io.emit('instance_deleted', { phone });
