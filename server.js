@@ -468,6 +468,10 @@ const HTML_LOGIN = `
 </html>
 `;
 // --- EXPRESS APP ROUTING ---
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
 app.get('/', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   const token = readSessionToken(req.headers.cookie);
