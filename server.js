@@ -4,8 +4,11 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import pino from 'pino';
 import { createClient } from '@supabase/supabase-js';
-import makeWASocket, { DisconnectReason, Browsers } from '@whiskeysockets/baileys';
+import baileys from '@whiskeysockets/baileys';
 import { useMultiSupabaseAuth } from './authState.js';
+
+const makeWASocket = baileys.default || baileys.makeWASocket;
+const { DisconnectReason, Browsers } = baileys;
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = process.env.PORT || 3000;
