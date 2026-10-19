@@ -8,13 +8,23 @@ import makeWASocket, { DisconnectReason, Browsers } from '@whiskeysockets/bailey
 import { useMultiSupabaseAuth } from './authState.js';
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
-const PASSWORD = process.env.DASHBOARD_PASSWORD || "admin123";
 const PORT = process.env.PORT || 3000;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+
+for (const [name, value] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY })) {
+  if (!value) throw new Error(`${name} environment variable is missing.`);
+}
 
 // Initialize cloud connection configurations
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
+const supabaseAuth = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+const SESSION_COOKIE = 'dashboard_access_token';
 
 const app = express();
 const server = createServer(app);
@@ -25,6 +35,55 @@ app.use(express.urlencoded({ extended: true }));
 
 // Storage container keeping track of active connected instance details
 const instances = {};
+
+function readSessionToken(cookieHeader = '') {
+  const cookie = cookieHeader.split(';').map(part => part.trim()).find(part => part.startsWith(`${SESSION_COOKIE}=`));
+  if (!cookie) return null;
+  try {
+    return decodeURIComponent(cookie.slice(SESSION_COOKIE.length + 1));
+  } catch {
+    return null;
+  }
+}
+
+function setSessionCookie(res, token) {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; Path=/; SameSite=Strict; Max-Age=3600${secure}`);
+}
+
+function clearSessionCookie(res) {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0${secure}`);
+}
+
+async function requireDashboardAuth(req, res, next) {
+  const token = readSessionToken(req.headers.cookie);
+  if (!token) return res.status(401).json({ error: 'Authentication required' });
+
+  try {
+    const { data, error } = await supabaseAuth.auth.getUser(token);
+    if (error || !data.user) return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    req.user = data.user;
+    next();
+  } catch (error) {
+    log.error({ err: error }, 'Dashboard authentication failed');
+    res.status(401).json({ error: 'Authentication failed' });
+  }
+}
+
+io.use(async (socket, next) => {
+  const token = readSessionToken(socket.request.headers.cookie);
+  if (!token) return next(new Error('Authentication required'));
+
+  try {
+    const { data, error } = await supabaseAuth.auth.getUser(token);
+    if (error || !data.user) return next(new Error('Authentication required'));
+    socket.data.user = data.user;
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 /**
  * Parses View Once messages out of active parallel numbers and hooks into Supabase
@@ -160,29 +219,42 @@ const HTML_DASHBOARD = `
   <title>WhatsApp Manager</title>
   <script src='/socket.io/socket.io.js'></script>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f6f8; margin: 0; padding: 20px; color: #333; }
-    .container { max-width: 600px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
-    h2 { margin-top: 0; color: #111; border-bottom: 2px solid #eaeaea; padding-bottom: 10px; }
-    .input-group { display: flex; gap: 10px; margin-bottom: 25px; }
-    input { flex: 1; padding: 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 16px; }
-    button { padding: 12px 20px; background: #007aff; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 15px; }
-    button:hover { background: #0062cc; }
-    .card { background: #fafafa; border: 1px solid #e5e5e5; padding: 15px; border-radius: 8px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
-    .status { font-weight: bold; padding: 4px 8px; border-radius: 4px; font-size: 13px; }
-    .CONNECTED { background: #e3fbe3; color: #1e7e34; }
-    .PAIRING_READY { background: #fff3cd; color: #856404; }
-    .CONNECTING { background: #e2e3e5; color: #383d41; }
-    .pairing-box { font-family: monospace; font-size: 18px; font-weight: bold; background: #333; color: #fff; padding: 4px 10px; border-radius: 4px; letter-spacing: 1px; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; margin: 0; padding: 32px 18px; color: #17221e; background: #f2f6f3; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .container { max-width: 760px; margin: 0 auto; padding: 30px; background: #fff; border: 1px solid #e2eae5; border-radius: 18px; box-shadow: 0 18px 55px rgba(24, 54, 39, .08); }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px; }
+    h1 { margin: 0; font-size: clamp(23px, 4vw, 30px); letter-spacing: -.6px; }
+    .subtitle { margin: 7px 0 0; color: #6a7770; font-size: 14px; }
+    .input-group { display: flex; gap: 10px; margin-bottom: 24px; }
+    input { min-width: 0; flex: 1; padding: 13px 14px; border: 1px solid #d5dfd9; border-radius: 9px; outline: none; font-size: 15px; }
+    input:focus { border-color: #168553; box-shadow: 0 0 0 3px rgba(22, 133, 83, .12); }
+    button { padding: 12px 17px; color: white; background: #168553; border: 0; border-radius: 9px; font-size: 14px; font-weight: 650; cursor: pointer; }
+    button:hover { background: #106c42; }
+    button.secondary { color: #34443b; background: #edf2ef; }
+    button.secondary:hover { background: #dfe8e2; }
+    .instance { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; padding: 15px 16px; background: #fbfcfb; border: 1px solid #e5ebe7; border-radius: 11px; }
+    .phone { font-weight: 700; }
+    .instance-meta { display: flex; align-items: center; justify-content: flex-end; gap: 9px; flex-wrap: wrap; }
+    .status { padding: 5px 9px; color: #4d5a53; background: #edf1ee; border-radius: 999px; font-size: 12px; font-weight: 700; }
+    .CONNECTED { color: #116b3e; background: #e2f5e9; }
+    .PAIRING_READY { color: #825909; background: #fff2d0; }
+    .CONNECTING { color: #52626c; background: #e8eef1; }
+    .pairing-box { padding: 6px 10px; color: #fff; background: #26352d; border-radius: 7px; font-family: ui-monospace, monospace; font-size: 16px; font-weight: 700; letter-spacing: 1.2px; }
+    .empty { padding: 30px 16px; color: #77827b; text-align: center; border: 1px dashed #d5dfd9; border-radius: 11px; }
+    @media (max-width: 520px) { body { padding: 16px 12px; } .container { padding: 21px 16px; } .input-group { flex-direction: column; } .input-group button { width: 100%; } .topbar { align-items: flex-start; } }
   </style>
 </head>
 <body>
   <div class='container'>
-    <h2>Linked WhatsApp Instances</h2>
-    <div class='input-group'>
-      <input type='number' id='phoneInput' placeholder='Country code + number (e.g. 923001234567)'>
-      <button onclick='addNumber()'>Link Instance</button>
+    <div class='topbar'>
+      <div><h1>WhatsApp Manager</h1><p class='subtitle'>Manage your linked WhatsApp numbers.</p></div>
+      <button class='secondary' id='logoutButton' type='button'>Log out</button>
     </div>
-    <div id='list'></div>
+    <div class='input-group'>
+      <input type='tel' id='phoneInput' inputmode='numeric' placeholder='Country code + number (e.g. 923001234567)'>
+      <button id='addButton' type='button'>Link instance</button>
+    </div>
+    <div id='list'><div class='empty'>No WhatsApp instances are linked yet.</div></div>
   </div>
 
   <script>
@@ -191,13 +263,18 @@ const HTML_DASHBOARD = `
 
     function render() {
       const container = document.getElementById('list');
+      const phones = Object.keys(activeInstances);
       container.innerHTML = '';
-      Object.keys(activeInstances).forEach(phone => {
+      if (!phones.length) {
+        container.innerHTML = '<div class="empty">No WhatsApp instances are linked yet.</div>';
+        return;
+      }
+      phones.forEach(phone => {
         const inst = activeInstances[phone];
         const div = document.createElement('div');
-        div.className = 'card';
-        div.innerHTML = '<div><strong>+' + phone + '</strong></div>' +
-          '<div>' + 
+        div.className = 'instance';
+        div.innerHTML = '<div class="phone">+' + phone + '</div>' +
+          '<div class="instance-meta">' +
             (inst.pairingCode ? '<span class="pairing-box">' + inst.pairingCode + '</span> ' : '') +
             '<span class="status ' + inst.status + '">' + inst.status + '</span>' +
           '</div>';
@@ -205,16 +282,23 @@ const HTML_DASHBOARD = `
       });
     }
 
-    function addNumber() {
+    async function addNumber() {
       const phone = document.getElementById('phoneInput').value.replace(/\\D/g, '');
-      if(!phone) return alert('Enter valid sequence numbers');
-      fetch('/api/instance', {
+      if (!phone) return alert('Enter a phone number including country code.');
+      const response = await fetch('/api/instance', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone, password: localStorage.getItem('dash_pwd') })
+        body: JSON.stringify({ phone })
       });
+      if (!response.ok) return alert('Could not link this number. Please sign in again and retry.');
       document.getElementById('phoneInput').value = '';
     }
+
+    document.getElementById('addButton').addEventListener('click', addNumber);
+    document.getElementById('logoutButton').addEventListener('click', async () => {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      window.location.assign('/');
+    });
 
     socket.on('status_update', (data) => {
       activeInstances[data.phone] = data;
@@ -226,9 +310,10 @@ const HTML_DASHBOARD = `
       render();
     });
 
-    fetch('/api/status?password=' + localStorage.getItem('dash_pwd'))
+    fetch('/api/status')
       .then(res => res.json())
       .then(data => {
+        if (!data || data.error) return;
         Object.assign(activeInstances, data);
         render();
       });
@@ -242,54 +327,131 @@ const HTML_LOGIN = `
 <html>
 <head>
   <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-  <title>Login</title>
+  <meta name='theme-color' content='#f2f6f3'>
+  <title>WhatsApp Manager · Sign in</title>
   <style>
-    body { font-family: -apple-system, sans-serif; background: #f4f6f8; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-    .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); width: 100%; max-width: 320px; text-align: center; }
-    input { width: 100%; padding: 12px; border: 1px solid #ccc; border-radius: 6px; margin: 15px 0; box-sizing: border-box; font-size: 16px; }
-    button { width: 100%; padding: 12px; background: #007aff; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 16px; }
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; display: grid; place-items: center; margin: 0; padding: 24px; color: #17221e; background: radial-gradient(circle at 15% 10%, #e2f1e8, transparent 35%), #f2f6f3; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .auth-card { width: min(100%, 420px); padding: 36px; background: #fff; border: 1px solid #e2eae5; border-radius: 18px; box-shadow: 0 22px 65px rgba(24, 54, 39, .11); }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+    .brand-mark { display: grid; width: 42px; height: 42px; place-items: center; color: #fff; background: #168553; border-radius: 13px; font-size: 21px; }
+    .brand-name { font-size: 14px; font-weight: 750; letter-spacing: .2px; }
+    h1 { margin: 0; font-size: 27px; letter-spacing: -.6px; }
+    .description { margin: 9px 0 24px; color: #69776f; font-size: 14px; line-height: 1.5; }
+    label { display: block; margin: 15px 0 7px; color: #34443b; font-size: 13px; font-weight: 650; }
+    input { width: 100%; padding: 12px 13px; color: #17221e; background: #fff; border: 1px solid #d5dfd9; border-radius: 9px; outline: none; font-size: 15px; }
+    input:focus { border-color: #168553; box-shadow: 0 0 0 3px rgba(22, 133, 83, .12); }
+    button { width: 100%; margin-top: 22px; padding: 13px; color: #fff; background: #168553; border: 0; border-radius: 9px; font-size: 15px; font-weight: 700; cursor: pointer; }
+    button:hover { background: #106c42; }
+    button:disabled { opacity: .65; cursor: wait; }
+    .switch { margin: 20px 0 0; color: #69776f; text-align: center; font-size: 14px; }
+    .switch button { width: auto; margin: 0; padding: 0; color: #137447; background: none; font: inherit; font-weight: 700; }
+    .message { min-height: 20px; margin: 14px 0 0; color: #b42318; font-size: 13px; line-height: 1.45; }
+    @media (max-width: 480px) { body { padding: 16px; } .auth-card { padding: 27px 22px; } }
   </style>
 </head>
 <body>
-  <div class='card'>
-    <h2>System Access</h2>
-    <input type='password' id='pwd' placeholder='Enter access token key'>
-    <button onclick='login()'>Verify Authorization</button>
-  </div>
+  <main class='auth-card'>
+    <div class='brand'><div class='brand-mark'>W</div><div class='brand-name'>WhatsApp Manager</div></div>
+    <h1 id='title'>Welcome back</h1>
+    <p class='description' id='description'>Sign in to manage your linked WhatsApp instances.</p>
+    <form id='authForm'>
+      <label for='email'>Email address</label>
+      <input id='email' name='email' type='email' autocomplete='email' placeholder='you@example.com' required>
+      <label for='password'>Password</label>
+      <input id='password' name='password' type='password' autocomplete='current-password' minlength='8' placeholder='At least 8 characters' required>
+      <button id='submitButton' type='submit'>Sign in</button>
+      <p class='message' id='message' role='status' aria-live='polite'></p>
+    </form>
+    <p class='switch'><span id='switchText'>New here?</span> <button id='switchButton' type='button'>Create account</button></p>
+  </main>
   <script>
-function login() {
-const val = document.getElementById('pwd').value;
-localStorage.setItem('dash_pwd', val);
-window.location.reload();
-}
-</script>
+    let isSignup = false;
+    const form = document.getElementById('authForm');
+    const submitButton = document.getElementById('submitButton');
+    const message = document.getElementById('message');
+    document.getElementById('switchButton').addEventListener('click', () => {
+      isSignup = !isSignup;
+      document.getElementById('title').textContent = isSignup ? 'Create your account' : 'Welcome back';
+      document.getElementById('description').textContent = isSignup ? 'Create an account to access WhatsApp Manager.' : 'Sign in to manage your linked WhatsApp instances.';
+      document.getElementById('switchText').textContent = isSignup ? 'Already have an account?' : 'New here?';
+      document.getElementById('switchButton').textContent = isSignup ? 'Sign in' : 'Create account';
+      submitButton.textContent = isSignup ? 'Create account' : 'Sign in';
+      document.getElementById('password').autocomplete = isSignup ? 'new-password' : 'current-password';
+      message.textContent = '';
+    });
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      message.textContent = '';
+      submitButton.disabled = true;
+      const originalText = isSignup ? 'Create account' : 'Sign in';
+      submitButton.textContent = isSignup ? 'Creating account…' : 'Signing in…';
+      try {
+        const response = await fetch(isSignup ? '/api/auth/signup' : '/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: document.getElementById('email').value, password: document.getElementById('password').value })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Authentication failed.');
+        window.location.assign('/');
+      } catch (error) {
+        message.textContent = error.message;
+        submitButton.disabled = false;
+        submitButton.textContent = originalText;
+      }
+    });
+  </script>
 </body>
 </html>
 `;
 // --- EXPRESS APP ROUTING ---
-app.get('/', (req, res) => {
-  res.send(`<script>
-    if (localStorage.getItem('dash_pwd') === ${JSON.stringify(PASSWORD)}) {
-      document.write(${JSON.stringify(HTML_DASHBOARD)});
-    } else {
-      document.write(${JSON.stringify(HTML_LOGIN)});
-    }
-  </script>`);
+app.get('/', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const token = readSessionToken(req.headers.cookie);
+  if (token) {
+    const { data, error } = await supabaseAuth.auth.getUser(token);
+    if (!error && data.user) return res.send(HTML_DASHBOARD);
+  }
+  res.send(HTML_LOGIN);
 });
-app.get('/api/status', (req, res) => {
-if (req.query.password !== PASSWORD) return res.status(401).json({ error: 'Deny' });
+app.post('/api/auth/signup', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (!email || password.length < 8) return res.status(400).json({ error: 'Enter a valid email and a password with at least 8 characters.' });
+
+  const { error: createError } = await supabase.auth.admin.createUser({ email, password, email_confirm: true });
+  if (createError) return res.status(400).json({ error: createError.message });
+
+  const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password });
+  if (error || !data.session) return res.status(400).json({ error: error?.message || 'Account created. Please sign in.' });
+  setSessionCookie(res, data.session.access_token);
+  res.json({ success: true });
+});
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password });
+  if (error || !data.session) return res.status(401).json({ error: 'Email or password is incorrect.' });
+  setSessionCookie(res, data.session.access_token);
+  res.json({ success: true });
+});
+app.post('/api/auth/logout', (req, res) => {
+  clearSessionCookie(res);
+  res.json({ success: true });
+});
+app.get('/api/status', requireDashboardAuth, (req, res) => {
 const simplifiedMap = {};
 Object.keys(instances).forEach(phone => {
 simplifiedMap[phone] = { phone, status: instances[phone].status, pairingCode: instances[phone].pairingCode };
 });
 res.json(simplifiedMap);
 });
-app.post('/api/instance', async (req, res) => {
-const { phone, password } = req.body;
-if (password !== PASSWORD) return res.status(401).json({ error: 'Deny' });
+app.post('/api/instance', requireDashboardAuth, async (req, res) => {
+const { phone } = req.body;
 if (!phone) return res.status(400).json({ error: 'Phone missing' });
-res.json({ success: true });
 await startInstance(phone.replace(/\D/g, ''));
+res.json({ success: true });
 });
 server.listen(PORT, () => {
 log.info(`Multi-instance execution engine deployed live on interface port: ${PORT}`);
