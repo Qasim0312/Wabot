@@ -139,24 +139,35 @@ io.use(async (socket, next) => {
  * Parses View Once messages out of active parallel numbers and hooks into Supabase
  */
 async function handleIncomingMessage(phone, msg) {
-  if (msg.key.fromMe) return;
+  if (!msg?.key || msg.key.fromMe || !msg.key.id || !msg.key.remoteJid) return;
   let messageContent = msg.message;
   let isViewOnce = false;
 
-  if (messageContent?.viewOnceMessageV2?.message) {
-    messageContent = messageContent.viewOnceMessageV2.message;
-    isViewOnce = true;
-  } else if (messageContent?.viewOnceMessage?.message) {
-    messageContent = messageContent.viewOnceMessage.message;
-    isViewOnce = true;
+  // Baileys may put a view-once payload inside ephemeral or caption wrappers.
+  // Unwrap repeatedly so the media type is found regardless of wrapper order.
+  const wrapperKeys = [
+    'ephemeralMessage',
+    'viewOnceMessage',
+    'viewOnceMessageV2',
+    'viewOnceMessageV2Extension',
+    'documentWithCaptionMessage'
+  ];
+  for (let depth = 0; messageContent && depth < 8; depth += 1) {
+    const wrapperKey = wrapperKeys.find(key => messageContent[key]?.message);
+    if (!wrapperKey) break;
+    if (wrapperKey.startsWith('viewOnceMessage')) isViewOnce = true;
+    messageContent = messageContent[wrapperKey].message;
   }
 
   if (!isViewOnce) return;
 
-  const mediaMsg = messageContent.imageMessage || messageContent.videoMessage || messageContent.audioMessage;
+  const mediaMsg = messageContent.imageMessage || messageContent.videoMessage ||
+    messageContent.audioMessage || messageContent.documentMessage;
   if (!mediaMsg) return;
 
-  let mediaType = messageContent.imageMessage ? 'image' : messageContent.videoMessage ? 'video' : 'audio';
+  const mediaType = messageContent.imageMessage ? 'image' :
+    messageContent.videoMessage ? 'video' :
+      messageContent.audioMessage ? 'audio' : 'document';
 
   const row = {
     instance_phone: phone,
@@ -172,8 +183,12 @@ async function handleIncomingMessage(phone, msg) {
     mime: mediaMsg.mimetype || ''
   };
 
-  await supabase.from('pending_views').upsert(row, { onConflict: 'wa_id' });
-  log.info({ phone, wa_id: msg.key.id }, 'View-Once elements buffered safely.');
+  const { error } = await supabase.from('pending_views').upsert(row, { onConflict: 'wa_id' });
+  if (error) {
+    log.error({ phone, wa_id: msg.key.id, code: error.code, message: error.message, details: error.details, hint: error.hint }, 'Failed to save View-Once metadata to Supabase');
+    return;
+  }
+  log.info({ phone, wa_id: msg.key.id }, 'View-Once metadata saved to Supabase.');
 }
 
 /**
