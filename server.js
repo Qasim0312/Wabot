@@ -5,6 +5,7 @@ import { Server } from 'socket.io';
 import pino from 'pino';
 import { createClient } from '@supabase/supabase-js';
 import baileys from '@whiskeysockets/baileys';
+import QRCode from 'qrcode';
 import { useMultiSupabaseAuth } from './authState.js';
 
 const makeWASocket = baileys.default || baileys.makeWASocket;
@@ -132,12 +133,12 @@ async function handleIncomingMessage(phone, msg) {
 /**
  * Initializes an isolated, independent WhatsApp session context loop
  */
-async function startInstance(phone) {
-  if (['CONNECTING', 'CONNECTED', 'PAIRING_READY'].includes(instances[phone]?.status)) return;
+async function startInstance(phone, connectionMethod = 'pairing') {
+  if (['CONNECTING', 'CONNECTED', 'PAIRING_READY', 'QR_READY'].includes(instances[phone]?.status)) return;
 
   const previousSocket = instances[phone]?.sock;
   log.info(`Launching isolated listener instance for line: ${phone}`);
-  instances[phone] = { status: 'CONNECTING', pairingCode: null, sock: null };
+  instances[phone] = { status: 'CONNECTING', pairingCode: null, qrCode: null, connectionMethod, sock: null };
   if (previousSocket) previousSocket.end(new Error('Instance reconnect requested'));
   io.emit('status_update', { phone, status: 'CONNECTING', pairingCode: null });
 
@@ -156,7 +157,7 @@ async function startInstance(phone) {
 
     let pairingRequested = false;
     const issuePairingCode = async () => {
-      if (pairingRequested || sock.authState.creds.registered) return;
+      if (connectionMethod !== 'pairing' || pairingRequested || sock.authState.creds.registered) return;
       pairingRequested = true;
       try {
         const code = await sock.requestPairingCode(phone);
@@ -183,11 +184,26 @@ async function startInstance(phone) {
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
       if (instances[phone]?.sock !== sock) return;
-      if (qr && !sock.authState.creds.registered) void issuePairingCode();
+      if (qr && !sock.authState.creds.registered) {
+        if (connectionMethod === 'qr') {
+          try {
+            const qrCode = await QRCode.toDataURL(qr);
+            if (instances[phone]?.sock !== sock) return;
+            instances[phone].qrCode = qrCode;
+            instances[phone].status = 'QR_READY';
+            io.emit('status_update', { phone, status: 'QR_READY', pairingCode: null, qrCode });
+          } catch (err) {
+            log.error({ err }, 'QR code rendering failed');
+          }
+        } else {
+          void issuePairingCode();
+        }
+      }
       if (connection === 'open') {
         instances[phone].status = 'CONNECTED';
         instances[phone].pairingCode = null;
-        io.emit('status_update', { phone, status: 'CONNECTED', pairingCode: null });
+        instances[phone].qrCode = null;
+        io.emit('status_update', { phone, status: 'CONNECTED', pairingCode: null, qrCode: null });
       }
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
@@ -197,7 +213,7 @@ async function startInstance(phone) {
           io.emit('instance_deleted', { phone });
           await auth.clearAll();
         } else {
-          instances[phone] = { status: 'DISCONNECTED', pairingCode: null, sock: null };
+          instances[phone] = { status: 'DISCONNECTED', pairingCode: null, qrCode: null, connectionMethod, sock: null };
           io.emit('status_update', { phone, status: 'DISCONNECTED', pairingCode: null });
           setTimeout(() => startInstance(phone), 5000);
         }
@@ -214,7 +230,7 @@ async function startInstance(phone) {
 
   } catch (err) {
     log.error(err, 'Instance crash fallback triggered');
-    instances[phone] = { status: 'CRASHED', pairingCode: null, sock: null };
+    instances[phone] = { status: 'CRASHED', pairingCode: null, qrCode: null, connectionMethod, sock: null };
     io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null });
   }
 }
@@ -248,6 +264,7 @@ const HTML_DASHBOARD = `
     .subtitle { margin: 7px 0 0; color: #6a7770; font-size: 14px; }
     .input-group { display: flex; gap: 10px; margin-bottom: 24px; }
     input { min-width: 0; flex: 1; padding: 13px 14px; border: 1px solid #d5dfd9; border-radius: 9px; outline: none; font-size: 15px; }
+    select { padding: 12px 13px; color: #26352d; background: #fff; border: 1px solid #d5dfd9; border-radius: 9px; font-size: 14px; }
     input:focus { border-color: #168553; box-shadow: 0 0 0 3px rgba(22, 133, 83, .12); }
     button { padding: 12px 17px; color: white; background: #168553; border: 0; border-radius: 9px; font-size: 14px; font-weight: 650; cursor: pointer; }
     button:hover { background: #106c42; }
@@ -260,10 +277,12 @@ const HTML_DASHBOARD = `
     .status { padding: 5px 9px; color: #4d5a53; background: #edf1ee; border-radius: 999px; font-size: 12px; font-weight: 700; }
     .CONNECTED { color: #116b3e; background: #e2f5e9; }
     .PAIRING_READY { color: #825909; background: #fff2d0; }
+    .QR_READY { color: #115d83; background: #e1f3fb; }
     .CONNECTING { color: #52626c; background: #e8eef1; }
     .pairing-box { padding: 6px 10px; color: #fff; background: #26352d; border-radius: 7px; font-family: ui-monospace, monospace; font-size: 16px; font-weight: 700; letter-spacing: 1.2px; }
+    .qr-code { width: 176px; height: 176px; padding: 7px; background: #fff; border: 1px solid #e5ebe7; border-radius: 9px; }
     .empty { padding: 30px 16px; color: #77827b; text-align: center; border: 1px dashed #d5dfd9; border-radius: 11px; }
-    @media (max-width: 520px) { body { padding: 16px 12px; } .container { padding: 21px 16px; } .input-group { flex-direction: column; } .input-group button { width: 100%; } .topbar { align-items: flex-start; } }
+    @media (max-width: 520px) { body { padding: 16px 12px; } .container { padding: 21px 16px; } .input-group { flex-direction: column; } .input-group button, .input-group select { width: 100%; } .topbar { align-items: flex-start; } }
   </style>
 </head>
 <body>
@@ -274,6 +293,10 @@ const HTML_DASHBOARD = `
     </div>
     <div class='input-group'>
       <input type='tel' id='phoneInput' inputmode='numeric' placeholder='Country code + number (e.g. 923001234567)'>
+      <select id='connectionMethod' aria-label='Connection method'>
+        <option value='pairing'>Pairing code</option>
+        <option value='qr'>QR code</option>
+      </select>
       <button id='addButton' type='button'>Link instance</button>
     </div>
     <div id='list'><div class='empty'>No WhatsApp instances are linked yet.</div></div>
@@ -298,6 +321,7 @@ const HTML_DASHBOARD = `
         div.innerHTML = '<div class="phone">+' + phone + '</div>' +
           '<div class="instance-meta">' +
             (inst.pairingCode ? '<span>Pairing code: <span class="pairing-box">' + inst.pairingCode + '</span></span> ' : '') +
+            (inst.qrCode ? '<img class="qr-code" src="' + inst.qrCode + '" alt="Scan this QR code with WhatsApp"> ' : '') +
             '<span class="status ' + inst.status + '">' + inst.status + '</span>' +
           '</div>';
         if (['DISCONNECTED', 'CRASHED'].includes(inst.status)) {
@@ -315,19 +339,19 @@ const HTML_DASHBOARD = `
     async function addNumber() {
       const phone = document.getElementById('phoneInput').value.replace(/\\D/g, '');
       if (!phone) return alert('Enter a phone number including country code.');
-      await connect(phone);
+      await connect(phone, document.getElementById('connectionMethod').value);
       document.getElementById('phoneInput').value = '';
     }
 
     async function reconnect(phone) {
-      await connect(phone);
+      await connect(phone, document.getElementById('connectionMethod').value);
     }
 
-    async function connect(phone) {
+    async function connect(phone, connectionMethod) {
       const response = await fetch('/api/instance', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone })
+        body: JSON.stringify({ phone, connectionMethod })
       });
       if (!response.ok) alert('Could not connect this number. Please sign in again and retry.');
     }
@@ -481,14 +505,20 @@ app.post('/api/auth/logout', (req, res) => {
 app.get('/api/status', requireDashboardAuth, (req, res) => {
 const simplifiedMap = {};
 Object.keys(instances).forEach(phone => {
-simplifiedMap[phone] = { phone, status: instances[phone].status, pairingCode: instances[phone].pairingCode };
+simplifiedMap[phone] = {
+  phone,
+  status: instances[phone].status,
+  pairingCode: instances[phone].pairingCode,
+  qrCode: instances[phone].qrCode
+};
 });
 res.json(simplifiedMap);
 });
 app.post('/api/instance', requireDashboardAuth, async (req, res) => {
-const { phone } = req.body;
+const { phone, connectionMethod } = req.body;
 if (!phone) return res.status(400).json({ error: 'Phone missing' });
-await startInstance(phone.replace(/\D/g, ''));
+const method = connectionMethod === 'qr' ? 'qr' : 'pairing';
+await startInstance(phone.replace(/\D/g, ''), method);
 res.json({ success: true });
 });
 server.listen(PORT, () => {
