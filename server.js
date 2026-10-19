@@ -39,6 +39,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Storage container keeping track of active connected instance details
 const instances = {};
+const removedInstances = new Set();
 
 function readSessionToken(cookieHeader = '') {
   const cookie = cookieHeader.split(';').map(part => part.trim()).find(part => part.startsWith(`${SESSION_COOKIE}=`));
@@ -134,16 +135,19 @@ async function handleIncomingMessage(phone, msg) {
  * Initializes an isolated, independent WhatsApp session context loop
  */
 async function startInstance(phone, connectionMethod = 'pairing') {
+  if (removedInstances.has(phone)) return;
   if (['CONNECTING', 'CONNECTED'].includes(instances[phone]?.status)) return;
 
   const previousSocket = instances[phone]?.sock;
   log.info(`Launching isolated listener instance for line: ${phone}`);
-  instances[phone] = { status: 'CONNECTING', pairingCode: null, qrCode: null, connectionMethod, sock: null };
+  const instanceState = { status: 'CONNECTING', pairingCode: null, qrCode: null, connectionMethod, sock: null };
+  instances[phone] = instanceState;
   if (previousSocket) previousSocket.end(new Error('Instance reconnect requested'));
   io.emit('status_update', { phone, status: 'CONNECTING', pairingCode: null });
 
   try {
     const auth = await useMultiSupabaseAuth(supabase, phone);
+    if (removedInstances.has(phone) || instances[phone] !== instanceState) return;
     
     const sock = makeWASocket({
       auth: auth.state,
@@ -235,6 +239,7 @@ async function startInstance(phone, connectionMethod = 'pairing') {
     });
 
   } catch (err) {
+    if (removedInstances.has(phone) || instances[phone] !== instanceState) return;
     log.error(err, 'Instance crash fallback triggered');
     instances[phone] = { status: 'CRASHED', pairingCode: null, qrCode: null, connectionMethod, sock: null };
     io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null });
@@ -282,6 +287,8 @@ const HTML_DASHBOARD = `
     button.secondary { color: #34443b; background: #edf2ef; }
     button.secondary:hover { background: #dfe8e2; }
     button.reconnect { padding: 7px 11px; }
+    button.remove-instance { padding: 7px 11px; color: #a12b24; background: #fff0ee; }
+    button.remove-instance:hover { background: #ffe0dc; }
     .instance { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; padding: 15px 16px; background: #fbfcfb; border: 1px solid #e5ebe7; border-radius: 11px; }
     .phone { font-weight: 700; }
     .instance-meta { display: flex; align-items: center; justify-content: flex-end; gap: 9px; flex-wrap: wrap; }
@@ -345,6 +352,12 @@ const HTML_DASHBOARD = `
           reconnectButton.addEventListener('click', () => reconnect(phone));
           div.querySelector('.instance-meta').appendChild(reconnectButton);
         }
+        const removeButton = document.createElement('button');
+        removeButton.className = 'remove-instance';
+        removeButton.type = 'button';
+        removeButton.textContent = 'Remove number';
+        removeButton.addEventListener('click', () => removeNumber(phone));
+        div.querySelector('.instance-meta').appendChild(removeButton);
         container.appendChild(div);
       });
     }
@@ -358,6 +371,15 @@ const HTML_DASHBOARD = `
 
     async function reconnect(phone) {
       await connect(phone, document.getElementById('connectionMethod').value);
+    }
+
+    async function removeNumber(phone) {
+      if (!confirm('Remove +' + phone + '? This will disconnect WhatsApp and delete its saved session.')) return;
+      const response = await fetch('/api/instance/' + encodeURIComponent(phone), { method: 'DELETE' });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        alert(result.error || 'Could not remove this number. Please retry.');
+      }
     }
 
     async function connect(phone, connectionMethod) {
@@ -537,6 +559,7 @@ if (!phone) return res.status(400).json({ error: 'Phone missing' });
 const method = connectionMethod === 'qr' ? 'qr' : 'pairing';
 const normalizedPhone = phone.replace(/\D/g, '');
 if (!normalizedPhone) return res.status(400).json({ error: 'Phone missing' });
+removedInstances.delete(normalizedPhone);
 const { error } = await supabase.from('whatsapp_sessions').upsert({
   phone: normalizedPhone,
   id: 'connection-method',
@@ -546,6 +569,24 @@ const { error } = await supabase.from('whatsapp_sessions').upsert({
 if (error) return res.status(500).json({ error: 'Could not save the connection method.' });
 await startInstance(normalizedPhone, method);
 res.json({ success: true });
+});
+app.delete('/api/instance/:phone', requireDashboardAuth, async (req, res) => {
+  const phone = String(req.params.phone || '').replace(/\D/g, '');
+  if (!phone) return res.status(400).json({ error: 'Phone missing' });
+
+  removedInstances.add(phone);
+  const instance = instances[phone];
+  delete instances[phone];
+  if (instance?.sock) instance.sock.end(new Error('Instance removed by dashboard'));
+
+  const { error } = await supabase.from('whatsapp_sessions').delete().eq('phone', phone);
+  if (error) {
+    log.error({ phone, err: error }, 'Failed to delete WhatsApp session from Supabase');
+    return res.status(500).json({ error: 'Could not delete the saved session from Supabase.' });
+  }
+
+  io.emit('instance_deleted', { phone });
+  res.json({ success: true });
 });
 server.listen(PORT, () => {
 log.info(`Multi-instance execution engine deployed live on interface port: ${PORT}`);
