@@ -1,30 +1,34 @@
-import { proto } from '@whiskeysockets/baileys';
+import baileys from '@whiskeysockets/baileys';
 
-export async function useSupabaseAuthState(supabase) {
+const { proto, initAuthCreds } = baileys;
+
+/**
+ * Dynamically resolves or provisions isolated authentication states 
+ * out of a single Supabase data table using the phone number as a partition scope.
+ */
+export async function useMultiSupabaseAuth(supabase, phone) {
   const readData = async (id) => {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('whatsapp_sessions')
       .select('data')
+      .eq('phone', phone)
       .eq('id', id)
       .maybeSingle();
-    
-    if (error) return null;
     return data?.data || null;
   };
 
   const writeData = async (id, value) => {
     await supabase
       .from('whatsapp_sessions')
-      .upsert({ id, data: value, updated_at: new Date().toISOString() });
+      .upsert({ phone, id, data: value, updated_at: new Date().toISOString() });
   };
 
   const removeData = async (id) => {
-    await supabase.from('whatsapp_sessions').delete().eq('id', id);
+    await supabase.from('whatsapp_sessions').delete().eq('phone', phone).eq('id', id);
   };
 
   let creds = await readData('creds');
   if (!creds) {
-    const { initAuthCreds } = await import('@whiskeysockets/baileys');
     creds = initAuthCreds();
     await writeData('creds', creds);
   }
@@ -64,7 +68,7 @@ export async function useSupabaseAuthState(supabase) {
       await writeData('creds', creds);
     },
     clearAll: async () => {
-      await supabase.from('whatsapp_sessions').delete().neq('id', 'keep-alive');
+      await supabase.from('whatsapp_sessions').delete().eq('phone', phone);
     }
   };
 }

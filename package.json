@@ -7,10 +7,12 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0",
-    "@whiskeysockets/baileys": "^6.6.0",
-    "dotenv": "^16.4.5",
-    "pino": "^9.0.0",
-    "qrcode-terminal": "^0.12.0"
+    "@supabase/supabase-js": "^2.78.0",
+    "@whiskeysockets/baileys": "^6.17.16",
+    "dotenv": "^16.6.1",
+    "express": "^5.3.0",
+    "pino": "^9.14.0",
+    "qrcode-terminal": "^0.12.0",
+    "socket.io": "^4.8.4"
   }
 }

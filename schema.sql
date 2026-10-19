@@ -1,13 +1,20 @@
--- 1. Table for tracking WhatsApp Multi-Device persistent session keys
-create table if not exists public.whatsapp_sessions (
-  id text primary key,
+-- 1. Drop old tables to apply structural changes
+drop table if exists public.whatsapp_sessions;
+drop table if exists public.pending_views;
+
+-- 2. Multi-instance Session tracking table
+create table public.whatsapp_sessions (
+  phone text not null, -- Key identifying which phone number owns this session
+  id text not null, -- Key identifying the Baileys token category
   data jsonb not null,
-  updated_at timestamp with time zone default timezone('utc'::text, now()) not null
+  updated_at timestamp with time zone default timezone('utc'::text, now()) not null,
+  primary key (phone, id) -- Composite primary key
 );
 
--- 2. Table to temporarily hold intercepted View Once message metadata
-create table if not exists public.pending_views (
+-- 3. Queue table updated to track target instances
+create table public.pending_views (
   id uuid default gen_random_uuid() primary key,
+  instance_phone text not null, -- Tracks which of your connected numbers received this file
   wa_id text not null unique,
   jid text not null,
   push_name text,
@@ -21,10 +28,8 @@ create table if not exists public.pending_views (
   created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
 
--- Enable Row Level Security (RLS) on both tables for security
+-- Enable RLS and setup full bypass rules for service role keys
 alter table public.whatsapp_sessions enable row level security;
 alter table public.pending_views enable row level security;
-
--- Create policies allowing all operations when using the Supabase Service Role Key
-create policy "Allow all service role actions on sessions" on public.whatsapp_sessions for all using (true) with check (true);
-create policy "Allow all service role actions on pending views" on public.pending_views for all using (true) with check (true);
+create policy "Allow master service actions on sessions" on public.whatsapp_sessions for all using (true) with check (true);
+create policy "Allow master service actions on views" on public.pending_views for all using (true) with check (true);
