@@ -134,7 +134,7 @@ async function handleIncomingMessage(phone, msg) {
  * Initializes an isolated, independent WhatsApp session context loop
  */
 async function startInstance(phone, connectionMethod = 'pairing') {
-  if (['CONNECTING', 'CONNECTED', 'PAIRING_READY', 'QR_READY'].includes(instances[phone]?.status)) return;
+  if (['CONNECTING', 'CONNECTED'].includes(instances[phone]?.status)) return;
 
   const previousSocket = instances[phone]?.sock;
   log.info(`Launching isolated listener instance for line: ${phone}`);
@@ -167,7 +167,7 @@ async function startInstance(phone, connectionMethod = 'pairing') {
         io.emit('status_update', { phone, status: 'PAIRING_READY', pairingCode: code });
       } catch (err) {
         log.error({ err }, 'Pairing engine generation challenge failed');
-        if (!sock.authState.creds.registered) {
+        if (instances[phone]?.sock === sock && !sock.authState.creds.registered) {
           delete sock.authState.creds.me;
           delete sock.authState.creds.pairingCode;
           await auth.saveCreds();
@@ -180,7 +180,9 @@ async function startInstance(phone, connectionMethod = 'pairing') {
       }
     };
 
-    sock.ev.on('creds.update', auth.saveCreds);
+    sock.ev.on('creds.update', () => {
+      if (instances[phone]?.sock === sock) return auth.saveCreds();
+    });
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
       if (instances[phone]?.sock !== sock) return;
@@ -194,6 +196,10 @@ async function startInstance(phone, connectionMethod = 'pairing') {
             io.emit('status_update', { phone, status: 'QR_READY', pairingCode: null, qrCode });
           } catch (err) {
             log.error({ err }, 'QR code rendering failed');
+            if (instances[phone]?.sock === sock) {
+              instances[phone].status = 'CRASHED';
+              io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null, qrCode: null });
+            }
           }
         } else {
           void issuePairingCode();
@@ -215,7 +221,7 @@ async function startInstance(phone, connectionMethod = 'pairing') {
         } else {
           instances[phone] = { status: 'DISCONNECTED', pairingCode: null, qrCode: null, connectionMethod, sock: null };
           io.emit('status_update', { phone, status: 'DISCONNECTED', pairingCode: null });
-          setTimeout(() => startInstance(phone), 5000);
+          setTimeout(() => startInstance(phone, connectionMethod), 5000);
         }
       }
     });
@@ -241,9 +247,14 @@ async function startInstance(phone, connectionMethod = 'pairing') {
 async function autoBootSavedSessions() {
   const { data, error } = await supabase.from('whatsapp_sessions').select('phone');
   if (error || !data) return;
+  const { data: savedMethods } = await supabase
+    .from('whatsapp_sessions')
+    .select('phone, data')
+    .eq('id', 'connection-method');
+  const methodByPhone = new Map((savedMethods || []).map(row => [row.phone, row.data?.method]));
   const uniquePhones = [...new Set(data.map(row => row.phone))];
   for (const phone of uniquePhones) {
-    await startInstance(phone);
+    await startInstance(phone, methodByPhone.get(phone) || 'pairing');
   }
 }
 
@@ -281,6 +292,7 @@ const HTML_DASHBOARD = `
     .CONNECTING { color: #52626c; background: #e8eef1; }
     .pairing-box { padding: 6px 10px; color: #fff; background: #26352d; border-radius: 7px; font-family: ui-monospace, monospace; font-size: 16px; font-weight: 700; letter-spacing: 1.2px; }
     .qr-code { width: 176px; height: 176px; padding: 7px; background: #fff; border: 1px solid #e5ebe7; border-radius: 9px; }
+    .help-text { margin: -13px 0 22px; color: #6a7770; font-size: 13px; line-height: 1.5; }
     .empty { padding: 30px 16px; color: #77827b; text-align: center; border: 1px dashed #d5dfd9; border-radius: 11px; }
     @media (max-width: 520px) { body { padding: 16px 12px; } .container { padding: 21px 16px; } .input-group { flex-direction: column; } .input-group button, .input-group select { width: 100%; } .topbar { align-items: flex-start; } }
   </style>
@@ -299,6 +311,7 @@ const HTML_DASHBOARD = `
       </select>
       <button id='addButton' type='button'>Link instance</button>
     </div>
+    <p class='help-text'>Saved sessions reconnect automatically. QR or pairing codes appear when the number needs to be linked.</p>
     <div id='list'><div class='empty'>No WhatsApp instances are linked yet.</div></div>
   </div>
 
@@ -324,7 +337,7 @@ const HTML_DASHBOARD = `
             (inst.qrCode ? '<img class="qr-code" src="' + inst.qrCode + '" alt="Scan this QR code with WhatsApp"> ' : '') +
             '<span class="status ' + inst.status + '">' + inst.status + '</span>' +
           '</div>';
-        if (['DISCONNECTED', 'CRASHED'].includes(inst.status)) {
+        if (['DISCONNECTED', 'CRASHED', 'PAIRING_READY', 'QR_READY'].includes(inst.status)) {
           const reconnectButton = document.createElement('button');
           reconnectButton.className = 'reconnect';
           reconnectButton.type = 'button';
@@ -522,7 +535,16 @@ app.post('/api/instance', requireDashboardAuth, async (req, res) => {
 const { phone, connectionMethod } = req.body;
 if (!phone) return res.status(400).json({ error: 'Phone missing' });
 const method = connectionMethod === 'qr' ? 'qr' : 'pairing';
-await startInstance(phone.replace(/\D/g, ''), method);
+const normalizedPhone = phone.replace(/\D/g, '');
+if (!normalizedPhone) return res.status(400).json({ error: 'Phone missing' });
+const { error } = await supabase.from('whatsapp_sessions').upsert({
+  phone: normalizedPhone,
+  id: 'connection-method',
+  data: { method },
+  updated_at: new Date().toISOString()
+});
+if (error) return res.status(500).json({ error: 'Could not save the connection method.' });
+await startInstance(normalizedPhone, method);
 res.json({ success: true });
 });
 server.listen(PORT, () => {
