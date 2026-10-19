@@ -1,6 +1,13 @@
 import baileys from '@whiskeysockets/baileys';
 
-const { proto, initAuthCreds } = baileys;
+const { proto, initAuthCreds, BufferJSON } = baileys;
+
+const deserialize = (value) => {
+  if (value == null) return null;
+  return JSON.parse(JSON.stringify(value), BufferJSON.reviver);
+};
+
+const serialize = (value) => JSON.parse(JSON.stringify(value, BufferJSON.replacer));
 
 /**
  * Dynamically resolves or provisions isolated authentication states 
@@ -14,13 +21,13 @@ export async function useMultiSupabaseAuth(supabase, phone) {
       .eq('phone', phone)
       .eq('id', id)
       .maybeSingle();
-    return data?.data || null;
+    return deserialize(data?.data);
   };
 
   const writeData = async (id, value) => {
     await supabase
       .from('whatsapp_sessions')
-      .upsert({ phone, id, data: value, updated_at: new Date().toISOString() });
+      .upsert({ phone, id, data: serialize(value), updated_at: new Date().toISOString() });
   };
 
   const removeData = async (id) => {

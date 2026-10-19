@@ -133,10 +133,12 @@ async function handleIncomingMessage(phone, msg) {
  * Initializes an isolated, independent WhatsApp session context loop
  */
 async function startInstance(phone) {
-  if (instances[phone]?.status === 'CONNECTING' || instances[phone]?.status === 'CONNECTED') return;
+  if (['CONNECTING', 'CONNECTED', 'PAIRING_READY'].includes(instances[phone]?.status)) return;
 
+  const previousSocket = instances[phone]?.sock;
   log.info(`Launching isolated listener instance for line: ${phone}`);
   instances[phone] = { status: 'CONNECTING', pairingCode: null, sock: null };
+  if (previousSocket) previousSocket.end(new Error('Instance reconnect requested'));
   io.emit('status_update', { phone, status: 'CONNECTING', pairingCode: null });
 
   try {
@@ -156,11 +158,16 @@ async function startInstance(phone) {
       setTimeout(async () => {
         try {
           const code = await sock.requestPairingCode(phone);
+          if (instances[phone]?.sock !== sock) return;
           instances[phone].pairingCode = code;
           instances[phone].status = 'PAIRING_READY';
           io.emit('status_update', { phone, status: 'PAIRING_READY', pairingCode: code });
         } catch (err) {
           log.error({ err }, 'Pairing engine generation challenge failed');
+          if (instances[phone]?.sock === sock) {
+            instances[phone].status = 'CRASHED';
+            io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null });
+          }
         }
       }, 3000);
     }
@@ -168,6 +175,7 @@ async function startInstance(phone) {
     sock.ev.on('creds.update', auth.saveCreds);
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
+      if (instances[phone]?.sock !== sock) return;
       if (connection === 'open') {
         instances[phone].status = 'CONNECTED';
         instances[phone].pairingCode = null;
@@ -175,12 +183,12 @@ async function startInstance(phone) {
       }
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
-        delete instances[phone];
-        
         if (code === DisconnectReason.loggedOut) {
+          delete instances[phone];
           io.emit('instance_deleted', { phone });
           await auth.clearAll();
         } else {
+          instances[phone] = { status: 'DISCONNECTED', pairingCode: null, sock: null };
           io.emit('status_update', { phone, status: 'DISCONNECTED', pairingCode: null });
           setTimeout(() => startInstance(phone), 5000);
         }
@@ -188,6 +196,7 @@ async function startInstance(phone) {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (instances[phone]?.sock !== sock) return;
       if (type !== 'notify') return;
       for (const msg of messages) {
         try { await handleIncomingMessage(phone, msg); } catch (e) { log.error(e); }
@@ -196,7 +205,7 @@ async function startInstance(phone) {
 
   } catch (err) {
     log.error(err, 'Instance crash fallback triggered');
-    delete instances[phone];
+    instances[phone] = { status: 'CRASHED', pairingCode: null, sock: null };
     io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null });
   }
 }
@@ -235,6 +244,7 @@ const HTML_DASHBOARD = `
     button:hover { background: #106c42; }
     button.secondary { color: #34443b; background: #edf2ef; }
     button.secondary:hover { background: #dfe8e2; }
+    button.reconnect { padding: 7px 11px; }
     .instance { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; padding: 15px 16px; background: #fbfcfb; border: 1px solid #e5ebe7; border-radius: 11px; }
     .phone { font-weight: 700; }
     .instance-meta { display: flex; align-items: center; justify-content: flex-end; gap: 9px; flex-wrap: wrap; }
@@ -278,9 +288,17 @@ const HTML_DASHBOARD = `
         div.className = 'instance';
         div.innerHTML = '<div class="phone">+' + phone + '</div>' +
           '<div class="instance-meta">' +
-            (inst.pairingCode ? '<span class="pairing-box">' + inst.pairingCode + '</span> ' : '') +
+            (inst.pairingCode ? '<span>Pairing code: <span class="pairing-box">' + inst.pairingCode + '</span></span> ' : '') +
             '<span class="status ' + inst.status + '">' + inst.status + '</span>' +
           '</div>';
+        if (['DISCONNECTED', 'CRASHED'].includes(inst.status)) {
+          const reconnectButton = document.createElement('button');
+          reconnectButton.className = 'reconnect';
+          reconnectButton.type = 'button';
+          reconnectButton.textContent = 'Reconnect';
+          reconnectButton.addEventListener('click', () => reconnect(phone));
+          div.querySelector('.instance-meta').appendChild(reconnectButton);
+        }
         container.appendChild(div);
       });
     }
@@ -288,13 +306,21 @@ const HTML_DASHBOARD = `
     async function addNumber() {
       const phone = document.getElementById('phoneInput').value.replace(/\\D/g, '');
       if (!phone) return alert('Enter a phone number including country code.');
+      await connect(phone);
+      document.getElementById('phoneInput').value = '';
+    }
+
+    async function reconnect(phone) {
+      await connect(phone);
+    }
+
+    async function connect(phone) {
       const response = await fetch('/api/instance', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ phone })
       });
-      if (!response.ok) return alert('Could not link this number. Please sign in again and retry.');
-      document.getElementById('phoneInput').value = '';
+      if (!response.ok) alert('Could not connect this number. Please sign in again and retry.');
     }
 
     document.getElementById('addButton').addEventListener('click', addNumber);
