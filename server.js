@@ -184,8 +184,14 @@ async function startInstance(phone, connectionMethod = 'pairing') {
       }
     };
 
-    sock.ev.on('creds.update', () => {
-      if (instances[phone]?.sock === sock) return auth.saveCreds();
+    sock.ev.on('creds.update', async (updatedCreds) => {
+      if (instances[phone]?.sock !== sock) return;
+      try {
+        await auth.saveCreds(updatedCreds);
+        if (sock.authState.creds.registered) await saveConnectionMethod(phone, connectionMethod);
+      } catch (err) {
+        log.error({ phone, err }, 'Failed to persist the WhatsApp session');
+      }
     });
 
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
@@ -210,6 +216,12 @@ async function startInstance(phone, connectionMethod = 'pairing') {
         }
       }
       if (connection === 'open') {
+        try {
+          await auth.saveCreds(sock.authState.creds);
+          await saveConnectionMethod(phone, connectionMethod);
+        } catch (err) {
+          log.error({ phone, err }, 'Failed to persist the connected WhatsApp session');
+        }
         instances[phone].status = 'CONNECTED';
         instances[phone].pairingCode = null;
         instances[phone].qrCode = null;
@@ -221,7 +233,19 @@ async function startInstance(phone, connectionMethod = 'pairing') {
         if (code === DisconnectReason.loggedOut) {
           delete instances[phone];
           io.emit('instance_deleted', { phone });
-          await auth.clearAll();
+          try {
+            await auth.clearAll();
+          } catch (err) {
+            log.error({ phone, err }, 'Failed to clear logged-out WhatsApp credentials');
+          }
+        } else if (!sock.authState.creds.registered) {
+          try {
+            await auth.clearAll();
+          } catch (err) {
+            log.error({ phone, err }, 'Failed to clear an unlinked WhatsApp attempt');
+          }
+          instances[phone] = { status: 'CRASHED', pairingCode: null, qrCode: null, connectionMethod, sock: null };
+          io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null, qrCode: null });
         } else {
           instances[phone] = { status: 'DISCONNECTED', pairingCode: null, qrCode: null, connectionMethod, sock: null };
           io.emit('status_update', { phone, status: 'DISCONNECTED', pairingCode: null });
@@ -250,17 +274,27 @@ async function startInstance(phone, connectionMethod = 'pairing') {
  * Automatically wakes up previously configured sessions from the database
  */
 async function autoBootSavedSessions() {
-  const { data, error } = await supabase.from('whatsapp_sessions').select('phone');
+  const { data, error } = await supabase.from('whatsapp_sessions').select('phone, data').eq('id', 'creds');
   if (error || !data) return;
   const { data: savedMethods } = await supabase
     .from('whatsapp_sessions')
     .select('phone, data')
     .eq('id', 'connection-method');
   const methodByPhone = new Map((savedMethods || []).map(row => [row.phone, row.data?.method]));
-  const uniquePhones = [...new Set(data.map(row => row.phone))];
+  const uniquePhones = [...new Set(data.filter(row => row.data?.registered).map(row => row.phone))];
   for (const phone of uniquePhones) {
     await startInstance(phone, methodByPhone.get(phone) || 'pairing');
   }
+}
+
+async function saveConnectionMethod(phone, method) {
+  const { error } = await supabase.from('whatsapp_sessions').upsert({
+    phone,
+    id: 'connection-method',
+    data: { method },
+    updated_at: new Date().toISOString()
+  });
+  if (error) throw error;
 }
 
 // --- FRONTEND UI HTML MARKUP ---
@@ -560,13 +594,6 @@ const method = connectionMethod === 'qr' ? 'qr' : 'pairing';
 const normalizedPhone = phone.replace(/\D/g, '');
 if (!normalizedPhone) return res.status(400).json({ error: 'Phone missing' });
 removedInstances.delete(normalizedPhone);
-const { error } = await supabase.from('whatsapp_sessions').upsert({
-  phone: normalizedPhone,
-  id: 'connection-method',
-  data: { method },
-  updated_at: new Date().toISOString()
-});
-if (error) return res.status(500).json({ error: 'Could not save the connection method.' });
 await startInstance(normalizedPhone, method);
 res.json({ success: true });
 });

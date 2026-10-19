@@ -14,7 +14,10 @@ const serialize = (value) => JSON.parse(JSON.stringify(value, BufferJSON.replace
  * out of a single Supabase data table using the phone number as a partition scope.
  */
 export async function useMultiSupabaseAuth(supabase, phone) {
+  const pendingData = new Map();
+
   const readData = async (id) => {
+    if (pendingData.has(id)) return pendingData.get(id);
     const { data } = await supabase
       .from('whatsapp_sessions')
       .select('data')
@@ -25,19 +28,27 @@ export async function useMultiSupabaseAuth(supabase, phone) {
   };
 
   const writeData = async (id, value) => {
-    await supabase
+    if (!creds?.registered) {
+      pendingData.set(id, value);
+      return;
+    }
+    const { error } = await supabase
       .from('whatsapp_sessions')
       .upsert({ phone, id, data: serialize(value), updated_at: new Date().toISOString() });
+    if (error) throw error;
   };
 
   const removeData = async (id) => {
-    await supabase.from('whatsapp_sessions').delete().eq('phone', phone).eq('id', id);
+    pendingData.delete(id);
+    if (creds?.registered) {
+      const { error } = await supabase.from('whatsapp_sessions').delete().eq('phone', phone).eq('id', id);
+      if (error) throw error;
+    }
   };
 
   let creds = await readData('creds');
   if (!creds) {
     creds = initAuthCreds();
-    await writeData('creds', creds);
   } else if (!creds.registered && creds.me) {
     // A previous pairing request may have closed before WhatsApp accepted it.
     delete creds.me;
@@ -76,11 +87,28 @@ export async function useMultiSupabaseAuth(supabase, phone) {
         }
       }
     },
-    saveCreds: async () => {
-      await writeData('creds', creds);
+    saveCreds: async (updatedCreds) => {
+      if (updatedCreds) Object.assign(creds, updatedCreds);
+      if (!creds.registered) {
+        pendingData.set('creds', creds);
+        return;
+      }
+      pendingData.set('creds', creds);
+      for (const [id, value] of pendingData) {
+        const { error } = await supabase.from('whatsapp_sessions').upsert({
+          phone,
+          id,
+          data: serialize(value),
+          updated_at: new Date().toISOString()
+        });
+        if (error) throw error;
+      }
+      pendingData.clear();
     },
     clearAll: async () => {
-      await supabase.from('whatsapp_sessions').delete().eq('phone', phone);
+      pendingData.clear();
+      const { error } = await supabase.from('whatsapp_sessions').delete().eq('phone', phone);
+      if (error) throw error;
     }
   };
 }
