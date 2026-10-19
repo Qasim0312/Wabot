@@ -53,10 +53,10 @@ async function getWhatsAppWebVersion() {
     log.warn({ err: result.error }, 'Could not fetch the live WhatsApp Web version; using Baileys bundled fallback');
   } else {
     log.info({ version: result.version }, 'Fetched live WhatsApp Web version');
+    cachedWhatsAppWebVersion = result.version;
+    whatsAppWebVersionFetchedAt = Date.now();
   }
-  cachedWhatsAppWebVersion = result.version;
-  whatsAppWebVersionFetchedAt = Date.now();
-  return cachedWhatsAppWebVersion;
+  return result.version;
 }
 
 function readSessionToken(cookieHeader = '') {
@@ -251,6 +251,11 @@ async function startInstance(phone, connectionMethod = 'pairing') {
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
         log.warn({ phone, code, err: lastDisconnect?.error }, 'WhatsApp connection closed');
+        if (code === 405) {
+          cachedWhatsAppWebVersion = null;
+          whatsAppWebVersionFetchedAt = 0;
+          log.warn({ phone }, 'Invalidated cached WhatsApp Web version after 405 rejection');
+        }
         if (code === DisconnectReason.loggedOut) {
           delete instances[phone];
           io.emit('instance_deleted', { phone });
