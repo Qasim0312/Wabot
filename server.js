@@ -9,7 +9,7 @@ import QRCode from 'qrcode';
 import { useMultiSupabaseAuth } from './authState.js';
 
 const makeWASocket = baileys.default || baileys.makeWASocket;
-const { DisconnectReason, Browsers, fetchLatestWaWebVersion } = baileys;
+const { DisconnectReason, Browsers, fetchLatestWaWebVersion, fetchLatestBaileysVersion } = baileys;
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = process.env.PORT || 3000;
@@ -48,15 +48,42 @@ async function getWhatsAppWebVersion() {
     return cachedWhatsAppWebVersion;
   }
 
-  const result = await fetchLatestWaWebVersion({ timeout: 10000 });
-  if (!result.isLatest) {
-    log.warn({ err: result.error }, 'Could not fetch the live WhatsApp Web version; using Baileys bundled fallback');
-  } else {
-    log.info({ version: result.version }, 'Fetched live WhatsApp Web version');
-    cachedWhatsAppWebVersion = result.version;
+  const liveResult = await fetchLatestWaWebVersion({
+    timeout: 10000,
+    headers: {
+      'sec-fetch-site': 'none',
+      'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    }
+  });
+  if (liveResult.isLatest) {
+    log.info({ version: liveResult.version, source: 'whatsapp-web' }, 'Resolved WhatsApp Web version');
+    cachedWhatsAppWebVersion = liveResult.version;
     whatsAppWebVersionFetchedAt = Date.now();
+    return cachedWhatsAppWebVersion;
   }
-  return result.version;
+
+  const baileysResult = await fetchLatestBaileysVersion({ timeout: 10000 });
+  if (baileysResult.isLatest) {
+    log.warn({
+      liveStatus: liveResult.error?.response?.status,
+      version: baileysResult.version,
+      source: 'baileys-repository'
+    }, 'Live WhatsApp Web version lookup failed; using Baileys repository version');
+    cachedWhatsAppWebVersion = baileysResult.version;
+    whatsAppWebVersionFetchedAt = Date.now();
+    return cachedWhatsAppWebVersion;
+  }
+
+  log.error({
+    liveStatus: liveResult.error?.response?.status,
+    liveError: liveResult.error?.message,
+    baileysError: baileysResult.error?.message,
+    version: liveResult.version,
+    source: 'bundled-fallback'
+  }, 'Both WhatsApp version lookups failed; using Baileys bundled fallback');
+  cachedWhatsAppWebVersion = liveResult.version;
+  whatsAppWebVersionFetchedAt = Date.now();
+  return cachedWhatsAppWebVersion;
 }
 
 function readSessionToken(cookieHeader = '') {
