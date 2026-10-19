@@ -9,7 +9,7 @@ import QRCode from 'qrcode';
 import { useMultiSupabaseAuth } from './authState.js';
 
 const makeWASocket = baileys.default || baileys.makeWASocket;
-const { DisconnectReason, Browsers } = baileys;
+const { DisconnectReason, Browsers, fetchLatestWaWebVersion } = baileys;
 
 const log = pino({ level: process.env.LOG_LEVEL || 'info' });
 const PORT = process.env.PORT || 3000;
@@ -40,6 +40,24 @@ app.use(express.urlencoded({ extended: true }));
 // Storage container keeping track of active connected instance details
 const instances = {};
 const removedInstances = new Set();
+let cachedWhatsAppWebVersion = null;
+let whatsAppWebVersionFetchedAt = 0;
+
+async function getWhatsAppWebVersion() {
+  if (cachedWhatsAppWebVersion && Date.now() - whatsAppWebVersionFetchedAt < 10 * 60 * 1000) {
+    return cachedWhatsAppWebVersion;
+  }
+
+  const result = await fetchLatestWaWebVersion({ timeout: 10000 });
+  if (!result.isLatest) {
+    log.warn({ err: result.error }, 'Could not fetch the live WhatsApp Web version; using Baileys bundled fallback');
+  } else {
+    log.info({ version: result.version }, 'Fetched live WhatsApp Web version');
+  }
+  cachedWhatsAppWebVersion = result.version;
+  whatsAppWebVersionFetchedAt = Date.now();
+  return cachedWhatsAppWebVersion;
+}
 
 function readSessionToken(cookieHeader = '') {
   const cookie = cookieHeader.split(';').map(part => part.trim()).find(part => part.startsWith(`${SESSION_COOKIE}=`));
@@ -148,9 +166,12 @@ async function startInstance(phone, connectionMethod = 'pairing') {
   try {
     const auth = await useMultiSupabaseAuth(supabase, phone);
     if (removedInstances.has(phone) || instances[phone] !== instanceState) return;
+    const version = await getWhatsAppWebVersion();
+    if (removedInstances.has(phone) || instances[phone] !== instanceState) return;
     
     const sock = makeWASocket({
       auth: auth.state,
+      version,
       logger: pino({ level: 'silent' }),
       browser: Browsers.ubuntu('Chrome'),
       markOnlineOnConnect: false,
