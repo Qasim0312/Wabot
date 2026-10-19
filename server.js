@@ -199,7 +199,7 @@ async function startInstance(phone, connectionMethod = 'pairing') {
     const sock = makeWASocket({
       auth: auth.state,
       version,
-      logger: pino({ level: 'silent' }),
+      logger: pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' }),
       browser: Browsers.ubuntu('Chrome'),
       markOnlineOnConnect: false,
       syncFullHistory: false
@@ -242,8 +242,16 @@ async function startInstance(phone, connectionMethod = 'pairing') {
       }
     });
 
-    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr, isNewLogin, receivedPendingNotifications }) => {
       if (instances[phone]?.sock !== sock) return;
+      log.info({
+        phone,
+        connection: connection || 'update',
+        hasQr: Boolean(qr),
+        isNewLogin: Boolean(isNewLogin),
+        registered: Boolean(sock.authState.creds.registered),
+        receivedPendingNotifications: Boolean(receivedPendingNotifications)
+      }, 'Baileys connection lifecycle update');
       if (qr && !sock.authState.creds.registered) {
         if (connectionMethod === 'qr') {
           try {
@@ -317,7 +325,7 @@ async function startInstance(phone, connectionMethod = 'pairing') {
 
   } catch (err) {
     if (removedInstances.has(phone) || instances[phone] !== instanceState) return;
-    log.error(err, 'Instance crash fallback triggered');
+    log.error({ phone, err }, 'Instance crash fallback triggered');
     instances[phone] = { status: 'CRASHED', pairingCode: null, qrCode: null, connectionMethod, sock: null };
     io.emit('status_update', { phone, status: 'CRASHED', pairingCode: null });
   }
