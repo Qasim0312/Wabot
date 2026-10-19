@@ -161,9 +161,15 @@ async function handleIncomingMessage(phone, msg) {
 
   if (!isViewOnce) return;
 
+  const messageContext = { phone, wa_id: msg.key.id, jid: msg.key.remoteJid };
+  log.info(messageContext, 'View-Once message received from WhatsApp.');
+
   const mediaMsg = messageContent.imageMessage || messageContent.videoMessage ||
     messageContent.audioMessage || messageContent.documentMessage;
-  if (!mediaMsg) return;
+  if (!mediaMsg) {
+    log.warn(messageContext, 'View-Once message received without a supported media payload; metadata was not saved.');
+    return;
+  }
 
   const mediaType = messageContent.imageMessage ? 'image' :
     messageContent.videoMessage ? 'video' :
@@ -183,12 +189,28 @@ async function handleIncomingMessage(phone, msg) {
     mime: mediaMsg.mimetype || ''
   };
 
-  const { error } = await supabase.from('pending_views').upsert(row, { onConflict: 'wa_id' });
-  if (error) {
-    log.error({ phone, wa_id: msg.key.id, code: error.code, message: error.message, details: error.details, hint: error.hint }, 'Failed to save View-Once metadata to Supabase');
+  const saveContext = {
+    ...messageContext,
+    media_type: mediaType,
+    mime: row.mime,
+    has_media_url: Boolean(row.media_url),
+    has_media_key: Boolean(row.media_key),
+    has_enc_sha256: Boolean(row.enc_sha256),
+    has_file_sha256: Boolean(row.file_sha256)
+  };
+  log.info(saveContext, 'Saving View-Once metadata to Supabase.');
+
+  try {
+    const { error } = await supabase.from('pending_views').upsert(row, { onConflict: 'wa_id' });
+    if (error) {
+      log.error({ ...saveContext, code: error.code, error_message: error.message, details: error.details, hint: error.hint }, 'Supabase rejected View-Once metadata save.');
+      return;
+    }
+  } catch (err) {
+    log.error({ ...saveContext, err }, 'Supabase request failed while saving View-Once metadata.');
     return;
   }
-  log.info({ phone, wa_id: msg.key.id }, 'View-Once metadata saved to Supabase.');
+  log.info(saveContext, 'View-Once metadata saved to Supabase.');
 }
 
 /**
